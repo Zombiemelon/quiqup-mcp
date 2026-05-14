@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { z } from "zod";
+import { QuiqupHttpError } from "@/lib/clients/quiqup-lastmile";
 
 /**
  * Flat auth context exposed to tool handlers. Built from `extra.authInfo`
@@ -42,7 +43,66 @@ export interface ToolSpec<
   handler: (
     auth: AuthContext,
     args: z.infer<TInput>,
-  ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
+  ) => Promise<{
+    content: Array<{ type: "text"; text: string }>;
+    isError?: boolean;
+  }>;
+}
+
+/**
+ * Build a tool-result payload from an upstream Quiqup HTTP error.
+ *
+ * The MCP wrapper catches `QuiqupHttpError` from any tool handler and
+ * returns this shape so the LLM caller sees the *actual* rejection reason
+ * (with `isError: true`) instead of an opaque RPC error. Without this, M3
+ * thin pass-throughs surfaced only the bare status code — see 2026-05-14
+ * bug report on `create_lastmile_order` repeatedly returning HTTP 422
+ * with no field-level detail reaching the LLM.
+ */
+function quiqupErrorToToolResult(err: QuiqupHttpError): {
+  content: Array<{ type: "text"; text: string }>;
+  isError: true;
+} {
+  const MAX_BODY = 4000;
+  const body =
+    err.body.length > MAX_BODY
+      ? `${err.body.slice(0, MAX_BODY)} ...[truncated, original ${err.body.length} chars]`
+      : err.body;
+
+  let hint = "";
+  if (err.status === 422 || err.status === 400) {
+    hint =
+      "This is a validation error from the upstream Quiqup API. " +
+      "Inspect the body's `attribute_errors[].detail`, `error_details[].detail`, " +
+      "or top-level `error` for the rejected field(s), then re-call with " +
+      "corrected arguments. If the body provides only a `request_id` and no " +
+      "field detail, the rejection is happening below the API gateway — escalate.";
+  } else if (err.status === 401 || err.status === 403) {
+    hint =
+      "Authentication or permission issue. The exchanged session-JWT may be " +
+      "expired or scope-insufficient for this operation/partner. Run `whoami_platform` " +
+      "to confirm the JWT still resolves on platform-api.";
+  } else if (err.status === 404) {
+    hint = "Resource not found. Verify path parameters (order id, sku, etc.).";
+  } else if (err.status >= 500) {
+    hint = "Quiqup upstream temporarily unavailable. Retry in a few seconds.";
+  }
+
+  const text = [
+    `Quiqup API returned HTTP ${err.status}.`,
+    "",
+    "Upstream response body:",
+    body,
+    hint ? "" : null,
+    hint ? `Hint: ${hint}` : null,
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+
+  return {
+    content: [{ type: "text" as const, text }],
+    isError: true,
+  };
 }
 
 // TODO(M4): the wrapper itself has no unit tests. While it stays a thin
@@ -120,7 +180,14 @@ export function registerTool<
         bearerToken: authInfo?.token ?? null,
       };
 
-      return spec.handler(auth, args as z.infer<TIn>);
+      try {
+        return await spec.handler(auth, args as z.infer<TIn>);
+      } catch (err) {
+        if (err instanceof QuiqupHttpError) {
+          return quiqupErrorToToolResult(err);
+        }
+        throw err;
+      }
     },
   );
 }
