@@ -2,6 +2,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import type { z } from "zod";
 import { QuiqupHttpError } from "@/lib/clients/quiqup-lastmile";
+import { emitAuditRecord } from "@/lib/middleware/audit";
+import {
+  getOrSet,
+  IDEMPOTENCY_DEFAULT_TTL_MS,
+} from "@/lib/middleware/idempotency";
+import { consume } from "@/lib/middleware/rate-limit";
 
 /**
  * Flat auth context exposed to tool handlers. Built from `extra.authInfo`
@@ -14,21 +20,64 @@ export interface AuthContext {
   sessionId: string | null;
   scopes: string[];
   // SENSITIVE — inbound Clerk OAuth at+jwt forwarded to upstream APIs (V3b
-  // same-IdP exchange pattern). TODO(M6): audit log must redact this field
-  // when emitting per-call records. Flagged in 2026-05-03 review.
+  // same-IdP exchange pattern). M6 audit log redacts this field at the
+  // pii-redact layer via the ALWAYS_REDACT_KEYS list (key "bearer" + "token"
+  // + "jwt"); the AuthContext itself is never passed to redactArgs anyway.
   bearerToken: string | null;
+}
+
+/**
+ * Per-tool guardrail configuration. OPT-IN: tools without a `guardrails`
+ * field on their spec get no middleware behaviour change (compatibility
+ * with the M2/M3 thin pass-through).
+ *
+ * M6 wires three behaviours, all gated by this object:
+ *   - rateLimit: token-bucket on `{userId, tool}`. Denials short-circuit
+ *     into an MCP error result with `isError: true` and a retry-hint string.
+ *   - idempotency: if the handler args include a string under `keyArg`,
+ *     wrap the handler in lib/middleware/idempotency.getOrSet so duplicate
+ *     calls within TTL return the cached result.
+ *   - audit: emit a structured JSON line on stdout (audit.ts). Defaults to
+ *     TRUE whenever `guardrails` is set — turning audit off for a
+ *     guardrailed tool would defeat the point. Set explicitly to `false`
+ *     for read-only tools that don't merit the noise.
+ *
+ * Scope checks are NOT here — they're per-tool helpers, see
+ * lib/middleware/scope.ts. The rationale is in that file's header.
+ */
+export interface GuardrailConfig {
+  rateLimit?: {
+    /** Max burst (= initial token count). */
+    capacity: number;
+    /** Sustained rate, tokens per second. */
+    refillPerSec: number;
+  };
+  idempotency?: {
+    /**
+     * Name of the arg key the caller uses to supply an idempotency key.
+     * If the arg is absent (or non-string), idempotency is skipped — the
+     * handler runs unwrapped. This is deliberate: forcing every call to
+     * supply a key would break LLM ergonomics on tools where the typical
+     * call is one-shot anyway.
+     */
+    keyArg: string;
+    /** Optional override; defaults to 15 minutes (idempotency.ts). */
+    ttlMs?: number;
+  };
+  /** Default true when `guardrails` is set on the spec; pass false to suppress. */
+  audit?: boolean;
 }
 
 /**
  * Typed tool specification. New tools export a `spec` of this shape and
  * register through `registerTool(server, spec)`. The wrapper is the
- * single chokepoint M4 will layer guardrails into (output-size,
- * error-shape, redact, scope, rate-limit, audit). At M2 it's a thin
- * pass-through plus auth extraction.
+ * single chokepoint M6 layers guardrails into (rate-limit, idempotency,
+ * audit). Output-size + schema enforcement remains TODO(M4).
  *
  * Output schema is carried on the spec for tests (e.g. asserting cassette
  * shape conformance via `spec.outputSchema.safeParse(cassette)`) but the
- * wrapper does NOT enforce it at runtime in M2 — M4 adds enforcement.
+ * wrapper does NOT enforce it at runtime — M4 will add a warn-only
+ * .safeParse pass.
  */
 // TODO(M4): tighten `z.ZodObject<any>` to `z.ZodObject<z.ZodRawShape>` — same
 // flexibility, no `any` escape hatch. Flagged in 2026-05-03 review.
@@ -53,6 +102,8 @@ export interface ToolSpec<
     content: ContentBlock[];
     isError?: boolean;
   }>;
+  /** Opt-in guardrails. Absent = no middleware behaviour change. */
+  guardrails?: GuardrailConfig;
 }
 
 /**
@@ -111,12 +162,16 @@ function quiqupErrorToToolResult(err: QuiqupHttpError): {
   };
 }
 
-// TODO(M4): the wrapper itself has no unit tests. While it stays a thin
-// pass-through that's borderline-fine, but M4 layers guardrails into this
-// function — at that point the wrapper *must* have its own tests
-// (registration roundtrip, auth extraction, output-schema enforcement,
-// guardrail bypass attempts). Flagged in 2026-05-03 review.
-//
+/**
+ * Build the composite key used by both rate-limit and idempotency caches.
+ * Format is deliberately stable so log-grep can correlate audit records
+ * with cache state: `${userId}:${tool}[:${idempKey}]`.
+ */
+function compositeKey(userId: string | null, tool: string, idempKey?: string): string {
+  const u = userId ?? "anon";
+  return idempKey === undefined ? `${u}:${tool}` : `${u}:${tool}:${idempKey}`;
+}
+
 // TODO(M4): output-schema enforcement. Currently `spec.outputSchema` is
 // carried but the wrapper does not parse handler output against it. M4
 // should add a warn-only `spec.outputSchema.safeParse(payload)` pass
@@ -160,11 +215,6 @@ export function registerTool<
       // handlers proceed thinking they're unauthenticated. Add a runtime
       // sanity check (e.g. `if (clerkAuth && !clerkAuth.subject) throw`)
       // to fail loud on shape drift. Flagged in 2026-05-03 review.
-      //
-      // TODO(M4): also consider per-tool "auth required" enforcement. The
-      // wrapper currently produces a fully-null AuthContext for unauth
-      // requests; tools that *require* auth should fail closed at the
-      // wrapper, not silently in the handler. Flagged in 2026-05-03 review.
       const clerkAuth = (
         authInfo?.extra as
           | {
@@ -186,14 +236,152 @@ export function registerTool<
         bearerToken: authInfo?.token ?? null,
       };
 
-      try {
-        return await spec.handler(auth, args as z.infer<TIn>);
-      } catch (err) {
-        if (err instanceof QuiqupHttpError) {
-          return quiqupErrorToToolResult(err);
-        }
-        throw err;
-      }
+      return invokeWithGuardrails(spec, auth, args);
     },
   );
 }
+
+/**
+ * Inner orchestration: rate-limit → idempotency wrap → handler → error map
+ *  → audit emit. Pulled out so unit tests can call it directly without
+ * spinning up an McpServer.
+ *
+ * Exported as `_invokeForTests` rather than wired into the public surface
+ * because the registerTool path is what production uses; tests just want
+ * to validate the orchestration shape.
+ */
+async function invokeWithGuardrails<
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  TIn extends z.ZodObject<any>,
+  TOut extends z.ZodTypeAny,
+>(
+  spec: ToolSpec<TIn, TOut>,
+  auth: AuthContext,
+  args: Record<string, unknown>,
+): Promise<{ content: ContentBlock[]; isError?: boolean }> {
+  const guardrails = spec.guardrails;
+  const auditEnabled = guardrails ? guardrails.audit !== false : false;
+  const start = Date.now();
+
+  // 1. Rate-limit gate. Denial returns the MCP error result immediately
+  //    AND is recorded in audit (the caller's pattern of hammering us is
+  //    exactly what audit logs need to surface).
+  if (guardrails?.rateLimit) {
+    const rlKey = compositeKey(auth.userId, spec.name);
+    const result = consume(
+      rlKey,
+      guardrails.rateLimit.capacity,
+      guardrails.rateLimit.refillPerSec,
+    );
+    if (!result.allowed) {
+      const retryAfter = result.retryAfterMs ?? 0;
+      if (auditEnabled) {
+        emitAuditRecord({
+          userId: auth.userId,
+          orgId: auth.orgId,
+          tool: spec.name,
+          args,
+          idempotencyKey: extractIdempotencyKey(args, guardrails),
+          durationMs: Date.now() - start,
+          ok: false,
+          error: `rate-limited; retry-after ${retryAfter}ms`,
+        });
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Rate limited; retry in ${retryAfter}ms`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  // 2. Idempotency wrap — but only if the caller actually supplied a key.
+  //    Without a key we run the handler directly; this keeps tools usable
+  //    without forcing every LLM call to invent a UUID.
+  const idempKey = extractIdempotencyKey(args, guardrails);
+
+  // 3. Build the actual handler execution as a closure so we can either
+  //    invoke directly or via getOrSet.
+  const runHandler = async (): Promise<{
+    content: ContentBlock[];
+    isError?: boolean;
+  }> => {
+    try {
+      return await spec.handler(auth, args as z.infer<TIn>);
+    } catch (err) {
+      if (err instanceof QuiqupHttpError) {
+        return quiqupErrorToToolResult(err);
+      }
+      throw err;
+    }
+  };
+
+  let outcome: { content: ContentBlock[]; isError?: boolean };
+  let outcomeError: string | undefined;
+  try {
+    if (guardrails?.idempotency && idempKey) {
+      const ttl = guardrails.idempotency.ttlMs ?? IDEMPOTENCY_DEFAULT_TTL_MS;
+      const cacheKey = compositeKey(auth.userId, spec.name, idempKey);
+      outcome = await getOrSet(cacheKey, ttl, runHandler);
+    } else {
+      outcome = await runHandler();
+    }
+    if (outcome.isError) {
+      outcomeError = "handler-returned-isError";
+    }
+  } catch (err) {
+    // 4. Error path — always emit audit, then rethrow. We don't transform
+    //    arbitrary errors into MCP results here (the SDK does its own
+    //    JSON-RPC error mapping); we just make sure audit fires.
+    if (auditEnabled) {
+      emitAuditRecord({
+        userId: auth.userId,
+        orgId: auth.orgId,
+        tool: spec.name,
+        args,
+        idempotencyKey: idempKey,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: (err as Error).message,
+      });
+    }
+    throw err;
+  }
+
+  // 5. Success path (including isError: true returned from handler — that
+  //    is a "structured failure" the LLM should see, not an exception).
+  if (auditEnabled) {
+    emitAuditRecord({
+      userId: auth.userId,
+      orgId: auth.orgId,
+      tool: spec.name,
+      args,
+      idempotencyKey: idempKey,
+      durationMs: Date.now() - start,
+      ok: outcome.isError !== true,
+      error: outcomeError,
+    });
+  }
+  return outcome;
+}
+
+function extractIdempotencyKey(
+  args: Record<string, unknown>,
+  guardrails: GuardrailConfig | undefined,
+): string | undefined {
+  const keyArg = guardrails?.idempotency?.keyArg;
+  if (!keyArg) return undefined;
+  const v = args[keyArg];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/**
+ * Exported ONLY for unit tests in tests/register-tool.test.ts. Lets tests
+ * exercise the guardrail orchestration without standing up an McpServer.
+ * Not part of the public API; do not import from production code.
+ */
+export const _invokeWithGuardrailsForTests = invokeWithGuardrails;
