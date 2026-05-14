@@ -1,15 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { http, HttpResponse } from "msw";
-import { server } from "./setup/msw";
-import cassette from "./cassettes/get-lastmile-order-label.json";
 
-vi.mock("@/lib/quiqup", async (importOriginal) => {
-  const actual = (await importOriginal()) as Record<string, unknown>;
-  return {
-    ...actual,
-    getQuiqupReadyJwt: vi.fn(async (_userId: string) => "test-jwt-for-msw"),
-  };
-});
+// Stable signing secret for tests. Must be ≥32 chars (lib/signed-url.ts).
+process.env.LABEL_URL_SIGNING_SECRET =
+  "test-secret-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+process.env.NEXT_PUBLIC_APP_URL = "https://mcp.test.quiqup.com";
 
 const auth = {
   userId: "user_test",
@@ -18,17 +12,6 @@ const auth = {
   scopes: ["read"],
   bearerToken: "inbound_at_jwt_unused_in_v3b",
 };
-
-// Replays the synthetic-PDF cassette as raw bytes with the
-// content-type the client branch detects on.
-const replayLabel = (orderId: string) =>
-  http.get(`https://api-ae.quiqup.com/order_label/${orderId}`, () => {
-    const bytes = Buffer.from(cassette.body_base64, "base64");
-    return new HttpResponse(bytes, {
-      status: cassette.status,
-      headers: { "content-type": cassette.content_type },
-    });
-  });
 
 describe("get_lastmile_order_label", () => {
   beforeEach(() => {
@@ -39,7 +22,7 @@ describe("get_lastmile_order_label", () => {
     it("registers under the expected name with required input schema", async () => {
       const mod = await import("../lib/tools/get-lastmile-order-label");
       expect(mod.spec.name).toBe("get_lastmile_order_label");
-      expect(mod.spec.description).toMatch(/label|pdf/i);
+      expect(mod.spec.description).toMatch(/label|pdf|url/i);
 
       const ok = mod.spec.inputSchema.safeParse({ order_id: "abc" });
       expect(ok.success).toBe(true);
@@ -64,9 +47,8 @@ describe("get_lastmile_order_label", () => {
   });
 
   describe("happy path", () => {
-    it("returns text summary + resource block carrying the PDF blob", async () => {
+    it("returns a text summary + resource_link pointing at the signed download URL", async () => {
       const orderId = "12345";
-      server.use(replayLabel(orderId));
 
       const mod = await import("../lib/tools/get-lastmile-order-label");
       const result = await mod.spec.handler(auth, { order_id: orderId });
@@ -74,134 +56,62 @@ describe("get_lastmile_order_label", () => {
       expect(result.isError).not.toBe(true);
       expect(result.content).toHaveLength(2);
 
-      const [summary, resource] = result.content;
+      const [summary, link] = result.content;
       if (summary.type !== "text") throw new Error("expected text summary");
       expect(summary.text).toMatch(new RegExp(`order_id=${orderId}`));
-      expect(summary.text).toMatch(/application\/pdf/);
+      // Don't leak the base64 PDF into the text channel any more.
+      expect(summary.text).not.toMatch(/base64/i);
 
-      if (resource.type !== "resource")
-        throw new Error("expected resource block");
-      expect(resource.resource.mimeType).toBe("application/pdf");
-      expect(resource.resource.uri).toMatch(
-        new RegExp(`^quiqup-lastmile://order_label/${orderId}\\.pdf$`),
-      );
+      if (link.type !== "resource_link")
+        throw new Error("expected resource_link block");
+      expect(link.mimeType).toBe("application/pdf");
+      expect(link.name).toBe(`awb_${orderId}.pdf`);
 
-      // The magic-byte check is the load-bearing assertion: confirms what
-      // the client extracts decodes to a real PDF, not a JSON string of a
-      // PDF or some other accidental double-encode.
-      const blob = (resource.resource as { blob: string }).blob;
-      expect(typeof blob).toBe("string");
-      const decoded = Buffer.from(blob, "base64").subarray(0, 5).toString();
-      expect(decoded).toBe("%PDF-");
+      const parsed = new URL(link.uri);
+      expect(parsed.origin).toBe("https://mcp.test.quiqup.com");
+      expect(parsed.pathname).toBe(`/api/label/${orderId}`);
+      expect(parsed.searchParams.get("u")).toBe(auth.userId);
+      expect(parsed.searchParams.get("sig")).toBeTruthy();
+      const exp = Number(parsed.searchParams.get("exp"));
+      expect(Number.isFinite(exp)).toBe(true);
+      // ~10 minutes (allow generous slack for slow runners).
+      const skewSeconds = exp - Math.floor(Date.now() / 1000);
+      expect(skewSeconds).toBeGreaterThan(9 * 60);
+      expect(skewSeconds).toBeLessThanOrEqual(10 * 60 + 5);
+
+      // The signed URL should match exactly between the two content blocks
+      // so hosts that render either path land on the same download.
+      expect(summary.text).toContain(link.uri);
     });
 
-    it("strips a charset parameter from the upstream content-type for mimeType", async () => {
-      server.use(
-        http.get("https://api-ae.quiqup.com/order_label/:id", () => {
-          const bytes = Buffer.from(cassette.body_base64, "base64");
-          return new HttpResponse(bytes, {
-            status: 200,
-            headers: { "content-type": "application/pdf; charset=binary" },
-          });
-        }),
-      );
-
+    it("encodes order ids with URL-unsafe characters", async () => {
+      const orderId = "AB CD/123";
       const mod = await import("../lib/tools/get-lastmile-order-label");
-      const result = await mod.spec.handler(auth, { order_id: "abc" });
-      const resource = result.content[1];
-      if (resource.type !== "resource")
-        throw new Error("expected resource block");
-      expect(resource.resource.mimeType).toBe("application/pdf");
-    });
-  });
-
-  describe("error mapping (via registerTool QuiqupHttpError wrapper)", () => {
-    // The handler doesn't try to remap upstream errors itself — it throws
-    // QuiqupHttpError from the shared client and lets the registerTool
-    // wrapper produce the isError:true tool-result. These tests reproduce
-    // the path end-to-end via spec.handler so the wrapper-shape isn't
-    // covered here (registerTool has its own unit tests); we just confirm
-    // that the handler does NOT swallow upstream failures.
-    it("throws QuiqupHttpError on 404 so the wrapper can surface it", async () => {
-      server.use(
-        http.get("https://api-ae.quiqup.com/order_label/:id", () =>
-          HttpResponse.json({ error: "Not Found" }, { status: 404 }),
-        ),
-      );
-      const mod = await import("../lib/tools/get-lastmile-order-label");
-      await expect(
-        mod.spec.handler(auth, { order_id: "missing" }),
-      ).rejects.toMatchObject({ status: 404 });
-    });
-
-    it("throws QuiqupHttpError on 401", async () => {
-      server.use(
-        http.get("https://api-ae.quiqup.com/order_label/:id", () =>
-          HttpResponse.json({ error: "Unauthorized" }, { status: 401 }),
-        ),
-      );
-      const mod = await import("../lib/tools/get-lastmile-order-label");
-      await expect(
-        mod.spec.handler(auth, { order_id: "abc" }),
-      ).rejects.toMatchObject({ status: 401 });
-    });
-
-    it("throws QuiqupHttpError on 5xx", async () => {
-      server.use(
-        http.get("https://api-ae.quiqup.com/order_label/:id", () =>
-          HttpResponse.json({ error: "upstream" }, { status: 503 }),
-        ),
-      );
-      const mod = await import("../lib/tools/get-lastmile-order-label");
-      await expect(
-        mod.spec.handler(auth, { order_id: "abc" }),
-      ).rejects.toMatchObject({ status: 503 });
+      const result = await mod.spec.handler(auth, { order_id: orderId });
+      const link = result.content[1];
+      if (link.type !== "resource_link")
+        throw new Error("expected resource_link block");
+      const parsed = new URL(link.uri);
+      // pathname is percent-encoded; decode and compare.
+      expect(decodeURIComponent(parsed.pathname)).toBe(`/api/label/${orderId}`);
     });
   });
 
-  describe("upstream content-type guard", () => {
-    it("returns isError when upstream returns 200 with non-PDF body (e.g. HTML edge error page)", async () => {
-      server.use(
-        http.get(
-          "https://api-ae.quiqup.com/order_label/:id",
-          () =>
-            new HttpResponse("<html><body>503 from edge</body></html>", {
-              status: 200,
-              headers: { "content-type": "text/html; charset=utf-8" },
-            }),
-        ),
-      );
+  describe("auth requirement", () => {
+    it("throws if no userId is present on the auth context", async () => {
       const mod = await import("../lib/tools/get-lastmile-order-label");
-      const result = await mod.spec.handler(auth, { order_id: "abc" });
-      expect(result.isError).toBe(true);
-      const first = result.content[0];
-      if (first.type !== "text") throw new Error("expected text block");
-      expect(first.text).toMatch(/unexpected content type/i);
-    });
-
-    it("returns isError when upstream returns no base64 body", async () => {
-      server.use(
-        http.get(
-          "https://api-ae.quiqup.com/order_label/:id",
-          () =>
-            new HttpResponse("", {
-              status: 200,
-              headers: { "content-type": "application/pdf" },
-            }),
-        ),
-      );
-      const mod = await import("../lib/tools/get-lastmile-order-label");
-      const result = await mod.spec.handler(auth, { order_id: "abc" });
-      expect(result.isError).toBe(true);
+      await expect(
+        mod.spec.handler({ ...auth, userId: null }, { order_id: "abc" }),
+      ).rejects.toThrow(/authenticated user/i);
     });
   });
 
   describe("output schema", () => {
-    it("validates the cassette response shape", async () => {
+    it("validates the {url, exp} shape", async () => {
       const mod = await import("../lib/tools/get-lastmile-order-label");
       const result = mod.spec.outputSchema.safeParse({
-        contentType: cassette.content_type,
-        base64: cassette.body_base64,
+        url: "https://example.com/api/label/abc?u=user_test&exp=1&sig=xyz",
+        exp: 1,
       });
       expect(result.success).toBe(true);
     });
