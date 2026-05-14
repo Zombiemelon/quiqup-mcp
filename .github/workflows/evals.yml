@@ -22,7 +22,11 @@ name: Evals
 #
 # Manual runs: trigger from the Actions tab via "Run workflow" (workflow_dispatch).
 
-on:
+# Note: `on` is quoted to avoid the YAML 1.1 boolean trap where some parsers
+# interpret unquoted `on:` as `true:`. GitHub Actions normally handles this
+# fine but a previous unquoted form was failing with `events: None` and
+# zero-second push runs (workflow_dispatch dispatch returned HTTP 422).
+"on":
   pull_request:
     paths:
       - "lib/tools/create-lastmile-order.ts"
