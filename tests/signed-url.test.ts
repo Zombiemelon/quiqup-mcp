@@ -80,6 +80,35 @@ describe("signed-url", () => {
     if (!verdict.ok) expect(verdict.reason).toBe("expired");
   });
 
+  it("rejects a non-ASCII sig without throwing (byte-length guard)", async () => {
+    // Regression for codex review on PR #6: the previous guard compared
+    // string lengths before timingSafeEqual; a multibyte `sig` with the
+    // same character count but different UTF-8 byte length crashed the
+    // route. Must surface as a clean `bad_signature`.
+    const { signLabelUrl, verifyLabelUrl } = await import("../lib/signed-url");
+    const { url } = signLabelUrl({
+      orderId: "order_1",
+      userId: "user_1",
+      baseUrl: "https://app.example.com",
+    });
+    const parsed = new URL(url);
+    const realSig = parsed.searchParams.get("sig") as string;
+    // Same character count as a base64url sha256 sig (43), but with a
+    // multibyte char so Buffer.byteLength differs from .length.
+    const evilSig = "é".repeat(realSig.length);
+    expect(evilSig.length).toBe(realSig.length);
+    expect(Buffer.byteLength(evilSig)).not.toBe(Buffer.byteLength(realSig));
+
+    const verdict = verifyLabelUrl({
+      orderId: "order_1",
+      userId: parsed.searchParams.get("u"),
+      exp: parsed.searchParams.get("exp"),
+      sig: evilSig,
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.reason).toBe("bad_signature");
+  });
+
   it("rejects missing params", async () => {
     const { verifyLabelUrl } = await import("../lib/signed-url");
     const verdict = verifyLabelUrl({

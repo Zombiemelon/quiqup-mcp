@@ -99,12 +99,13 @@ export function verifyLabelUrl({
   if (expNum * 1000 < now()) return { ok: false, reason: "expired" };
 
   const expected = hmac(orderId, userId, expNum);
-  // Both base64url; same charset, same length when valid. Length mismatch
-  // means the caller fabricated the field — short-circuit so timingSafeEqual
-  // doesn't throw on length mismatch.
-  if (expected.length !== sig.length) return { ok: false, reason: "bad_signature" };
+  // Compare BYTE lengths, not character lengths: a crafted non-ASCII `sig`
+  // can have the same string length but a different UTF-8 byte length, and
+  // timingSafeEqual throws on length mismatch — which would surface as a
+  // 500 from a public route instead of a clean `bad_signature`.
   const a = Buffer.from(expected);
   const b = Buffer.from(sig);
+  if (a.length !== b.length) return { ok: false, reason: "bad_signature" };
   if (!timingSafeEqual(a, b)) return { ok: false, reason: "bad_signature" };
 
   return { ok: true, userId, orderId, exp: expNum };
