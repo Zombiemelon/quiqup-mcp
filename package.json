@@ -10,7 +10,10 @@
     "test:watch": "vitest",
     "test:integration": "RUN_INTEGRATION=1 vitest run",
     "eval:lastmile-orders": "bun run evals/lastmile-order-creation.ts",
-    "eval:lastmile-roundtrip": "bun run evals/lastmile-order-roundtrip.ts"
+    "eval:lastmile-roundtrip": "bun run evals/lastmile-order-roundtrip.ts",
+    "eval:fulfilment-orders": "bun run evals/fulfilment-order-creation.ts",
+    "eval:recent-orders": "bun run evals/recent-orders.ts",
+    "eval:lastmile-cancel": "bun run evals/lastmile-order-cancel-roundtrip.ts"
   },
   "dependencies": {
     "@clerk/mcp-tools": "^0.5.0",
