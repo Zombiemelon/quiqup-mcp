@@ -14,6 +14,7 @@
     "eval:fulfilment-orders": "bun run evals/fulfilment-order-creation.ts",
     "eval:recent-orders": "bun run evals/recent-orders.ts",
     "eval:lastmile-cancel": "bun run evals/lastmile-order-cancel-roundtrip.ts",
+    "eval:staging-state-change": "bun run evals/staging-state-change-roundtrip.ts",
     "eval:tool-surface": "bun run evals/tool-surface.ts"
   },
   "dependencies": {

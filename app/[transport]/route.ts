@@ -46,6 +46,13 @@ import { spec as bookInboundSlotSpec } from "@/lib/tools/book-inbound-slot";
 import { spec as bulkValidateProductsSpec } from "@/lib/tools/bulk-validate-products";
 import { spec as bulkCommitProductsSpec } from "@/lib/tools/bulk-commit-products";
 
+// Staging-only state-machine helpers (Postman: Quiqup Staging State Change).
+// Each pins `environment: z.literal("staging")` at the input schema, so any
+// non-staging call is rejected by the validator before the handler runs.
+import { spec as setOutForDeliveryBatchSpec } from "@/lib/tools/set-out-for-delivery-batch";
+import { spec as setCollectionFailedBatchSpec } from "@/lib/tools/set-collection-failed-batch";
+import { spec as setDeliveryFailedBatchSpec } from "@/lib/tools/set-delivery-failed-batch";
+
 const handler = createMcpHandler(
   (server) => {
     // -- Legacy tools (own register*() functions per M1 audit) --
@@ -89,6 +96,11 @@ const handler = createMcpHandler(
     registerTool(server, bookInboundSlotSpec);
     registerTool(server, bulkValidateProductsSpec);
     registerTool(server, bulkCommitProductsSpec);
+
+    // -- Staging-only state-machine helpers (env pinned in the schema) --
+    registerTool(server, setOutForDeliveryBatchSpec);
+    registerTool(server, setCollectionFailedBatchSpec);
+    registerTool(server, setDeliveryFailedBatchSpec);
   },
   {},
   { basePath: "" },
