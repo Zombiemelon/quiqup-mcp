@@ -102,7 +102,23 @@ const handler = createMcpHandler(
     registerTool(server, setCollectionFailedBatchSpec);
     registerTool(server, setDeliveryFailedBatchSpec);
   },
-  {},
+  {
+    // SEP-973 `icons` on `Implementation` — Claude.ai's connector UI renders
+    // this in the card. Requires `as any` because mcp-handler's typed
+    // serverInfo hasn't been widened to the SDK's full Implementation yet;
+    // the field passes through to the underlying MCP Server at runtime.
+    serverInfo: {
+      name: "Quiqup Orders",
+      version: "0.1.0",
+      icons: [
+        {
+          src: `${process.env.NEXT_PUBLIC_APP_URL ?? ""}/quiqup-logo.svg`,
+          mimeType: "image/svg+xml",
+          sizes: ["any"],
+        },
+      ],
+    } as never,
+  },
   { basePath: "" },
 );
 
