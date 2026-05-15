@@ -43,6 +43,8 @@ next-env.d.ts
 
 # claude code — per-developer local settings (project-shared settings.json IS committed)
 .claude/settings.local.json
+# claude code — agent worktree isolation workspaces (local-only checkouts)
+.claude/worktrees/
 
 # python bytecode caches (from docs/quiqup-api/scripts/)
 __pycache__/

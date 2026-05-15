@@ -13,7 +13,8 @@
     "eval:lastmile-roundtrip": "bun run evals/lastmile-order-roundtrip.ts",
     "eval:fulfilment-orders": "bun run evals/fulfilment-order-creation.ts",
     "eval:recent-orders": "bun run evals/recent-orders.ts",
-    "eval:lastmile-cancel": "bun run evals/lastmile-order-cancel-roundtrip.ts"
+    "eval:lastmile-cancel": "bun run evals/lastmile-order-cancel-roundtrip.ts",
+    "eval:tool-surface": "bun run evals/tool-surface.ts"
   },
   "dependencies": {
     "@clerk/mcp-tools": "^0.5.0",
