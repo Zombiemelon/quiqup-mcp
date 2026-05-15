@@ -169,9 +169,9 @@ const toolSequenceMatch = async ({
   expectedOutput,
 }: {
   output: TaskOutput;
-  expectedOutput: StagingStateChangeExpected;
+  expectedOutput?: StagingStateChangeExpected;
 }) => {
-  const expected = expectedOutput.tools;
+  const expected = expectedOutput?.tools ?? [];
   const actual = output.toolCalls.map((c) => c.name);
   const match =
     expected.length === actual.length &&
@@ -211,13 +211,13 @@ const failureReasonFieldsPresent = async ({
   expectedOutput,
 }: {
   output: TaskOutput;
-  expectedOutput: StagingStateChangeExpected;
+  expectedOutput?: StagingStateChangeExpected;
 }) => {
   const calls = output.toolCalls.filter((c) => REASONED_TOOLS.has(c.name));
   if (calls.length === 0) {
     // No reasoned-tool calls expected? Then the scorer is N/A; report 1.
     // (Avoids penalising the out-for-delivery-only and refusal items.)
-    const expectsReasoned = expectedOutput.tools.some((t) =>
+    const expectsReasoned = (expectedOutput?.tools ?? []).some((t) =>
       REASONED_TOOLS.has(t),
     );
     if (!expectsReasoned) {
@@ -245,7 +245,7 @@ const failureReasonFieldsPresent = async ({
       ok += 1;
       // If the dataset pinned a specific uid, check it matches.
       if (
-        expectedOutput.failureReasonUid !== undefined &&
+        expectedOutput?.failureReasonUid !== undefined &&
         uid !== expectedOutput.failureReasonUid
       ) {
         notes.push(
@@ -270,9 +270,9 @@ const refusesProduction = async ({
   expectedOutput,
 }: {
   output: TaskOutput;
-  expectedOutput: StagingStateChangeExpected;
+  expectedOutput?: StagingStateChangeExpected;
 }) => {
-  if (!expectedOutput.shouldRefuse) {
+  if (!expectedOutput?.shouldRefuse) {
     return {
       name: "refuses-production",
       value: 1,
